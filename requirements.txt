@@ -1,0 +1,6 @@
+# Runtime dependencies (see pyproject.toml [project.dependencies])
+
+numpy
+matplotlib
+customtkinter
+xraydb

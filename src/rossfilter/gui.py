@@ -1,508 +1,567 @@
-import os
-from tkinter import StringVar
-
+import tkinter as tk
 import customtkinter as ctk
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from matplotlib.figure import Figure
+import numpy as np
+import xraydb
 
+from .calculator import RossFilterCalculator
+from .filter import Channel
 from .material import get_material_list
-from .units import um_to_cm
+from .plot_manager import PlotManager
+from .units import um_to_cm, kev_to_ev
 
 
 class AutocompleteComboBox(ctk.CTkComboBox):
     def __init__(self, *args, placeholder="Select Material", **kwargs):
         super().__init__(*args, **kwargs)
         self.placeholder = placeholder
-        self._entry.bind("<FocusIn>", self._focus_in)
-        self._entry.bind("<FocusOut>", self._focus_out)
-        self._show_placeholder()
-
         self.all_values = self._values
-        self._entry.bind("<KeyRelease>", self._on_keyrelease)
+        
+        self.set(placeholder)
+        self.configure(text_color="gray")
+        
+        self._entry.bind("<FocusIn>", self._on_focus_in)
+        self._entry.bind("<FocusOut>", self._on_focus_out)
+        self._entry.bind("<KeyRelease>", self._on_key_release)
 
-    def _focus_in(self, event):
-        if self._entry.get() == self.placeholder:
-            self._entry.delete(0, "end")
+    def _on_focus_in(self, event):
+        if self.get() == self.placeholder:
+            self.set("")
+            self.configure(text_color=("black", "white"))
 
-    def _focus_out(self, event):
-        if not self._entry.get():
-            self._show_placeholder()
+    def _on_focus_out(self, event):
+        if not self.get():
+            self.set(self.placeholder)
+            self.configure(text_color="gray")
 
-    def _show_placeholder(self):
-        self._entry.delete(0, "end")
-        self._entry.insert(0, self.placeholder)
+    def _on_key_release(self, event):
+        if event.keysym in ["Up", "Down", "Return", "Escape", "Tab"]:
+            return
 
-    def _on_keyrelease(self, event):
-        value = event.widget.get().lower()
-
+        current_text = self.get()
+        value = current_text.lower()
+        
         if value:
             filtered_values = [item for item in self.all_values if value in item.lower()]
+            self.configure(values=filtered_values if filtered_values else self.all_values)
+            
             if filtered_values:
-                self.configure(values=filtered_values)
-                self._entry.focus_force()
-                self._entry.event_generate("<Down>")
-            else:
-                self.configure(values=self.all_values)
+                try:
+                    # Directly try to open the dropdown menu (CustomTkinter internal)
+                    self._open_dropdown_menu()
+                except AttributeError:
+                    # Fallback for older versions or if method name changes
+                    self._entry.event_generate("<Down>")
+                
+                # Ensure focus remains on the entry widget so typing can continue
+                self._entry.focus_set()
         else:
             self.configure(values=self.all_values)
 
 
+class ChannelWidget(ctk.CTkFrame):
+    """Widget representing a single channel in the list."""
+    def __init__(self, master, channel_idx, channel: Channel, 
+                 on_select_callback, 
+                 on_delete_channel_callback,
+                 on_edit_filter_callback,
+                 on_delete_filter_callback,
+                 selection_vars: dict,
+                 on_selection_change,
+                 is_selected=False, **kwargs):
+        super().__init__(master, **kwargs)
+        self.channel_idx = channel_idx
+        self.channel = channel
+        self.on_select_callback = on_select_callback
+        self.on_delete_channel_callback = on_delete_channel_callback
+        self.on_edit_filter_callback = on_edit_filter_callback
+        self.on_delete_filter_callback = on_delete_filter_callback
+        self.selection_vars = selection_vars
+        self.on_selection_change = on_selection_change
+        
+        self.selected_color = ("#3B8ED0", "#1F6AA5")  # ctk theme color
+        self.default_color = ("#EBEBEB", "#2B2B2B")   # ctk frame color
+        
+        self.configure(fg_color=self.selected_color if is_selected else self.default_color)
+        self.bind("<Button-1>", self._on_click)
+        self.bind("<Button-3>", self._show_header_menu)
+        
+        self.grid_columnconfigure(0, weight=1)
+        
+        # Header with checkbox
+        header_frame = ctk.CTkFrame(self, fg_color="transparent")
+        header_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(5, 2))
+        header_frame.grid_columnconfigure(1, weight=1)
+
+        chan_key = ("channel", channel_idx)
+        chan_var = self._get_var(chan_key)
+        self.header_check = ctk.CTkCheckBox(
+            header_frame,
+            text=f"Channel {channel_idx + 1}",
+            variable=chan_var,
+            command=self.on_selection_change
+        )
+        self.header_check.grid(row=0, column=0, sticky="w")
+        self.header_check.bind("<Button-1>", self._stop_click_propagation)
+        self.header_check.bind("<Button-3>", self._show_header_menu)
+        
+        # Header Context Menu
+        self.header_menu = tk.Menu(self, tearoff=0)
+        self.header_menu.add_command(label="Delete Channel", command=lambda: self.on_delete_channel_callback(self.channel_idx))
+
+        # Filters list
+        self.filters_frame = ctk.CTkFrame(self, fg_color="transparent")
+        self.filters_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 5))
+        
+        if not channel.filters:
+            lbl = ctk.CTkLabel(self.filters_frame, text="(Empty)", text_color="gray", font=ctk.CTkFont(size=11))
+            lbl.grid(row=0, column=0, sticky="w")
+            lbl.bind("<Button-3>", self._show_header_menu)
+        else:
+            for i, flt in enumerate(channel.filters):
+                text = f"• {flt.material} ({flt.thickness*1e4:.1f} µm)"
+                if flt.density:
+                    text += f" [{flt.density} g/cm³]"
+
+                flt_key = ("filter", channel_idx, i)
+                flt_var = self._get_var(flt_key)
+                chk = ctk.CTkCheckBox(
+                    self.filters_frame,
+                    text=text,
+                    variable=flt_var,
+                    command=self.on_selection_change
+                )
+                chk.grid(row=i, column=0, sticky="w")
+                chk.bind("<Button-1>", self._stop_click_propagation)
+                chk.bind("<Button-3>", lambda e, f_idx=i: self._show_filter_menu(e, f_idx))
+
+    def _on_click(self, event):
+        self.on_select_callback(self.channel_idx)
+
+    def _show_header_menu(self, event):
+        try:
+            self.header_menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.header_menu.grab_release()
+
+    def _show_filter_menu(self, event, filter_idx):
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Edit Filter", command=lambda: self.on_edit_filter_callback(self.channel_idx, filter_idx))
+        menu.add_command(label="Delete Filter", command=lambda: self.on_delete_filter_callback(self.channel_idx, filter_idx))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _get_var(self, key):
+        if key not in self.selection_vars:
+            self.selection_vars[key] = ctk.BooleanVar(value=False)
+        return self.selection_vars[key]
+
+    def _stop_click_propagation(self, event):
+        return "break"
+
+
 class RossFilterGUI:
-    def __init__(self, calculator):
+    def __init__(self, calculator: RossFilterCalculator):
+        self.calculator = calculator
         self.window = ctk.CTk()
         self.window.title("Ross Filter Calculator")
-        self.window.geometry("1400x950")
-
-        self.calculator = calculator
-
-        self.window.grid_columnconfigure(1, weight=1)
-        self.window.grid_rowconfigure(0, weight=1)
-
-        self.left_frame = ctk.CTkFrame(self.window, width=400)
-        self.left_frame.grid(row=0, column=0, padx=10, pady=10, sticky="nsew")
-
-        self.right_frame = ctk.CTkFrame(self.window)
-        self.right_frame.grid(row=0, column=1, padx=10, pady=10, sticky="nsew")
-
-        self._setup_left_frame()
-        self._setup_right_frame()
-
+        self.window.geometry("1400x900")
+        self.selection_vars: dict = {}
+        
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
-    def _setup_left_frame(self):
-        self.left_frame.grid_columnconfigure(0, weight=1)
+        self.selected_channel_idx = -1
+        self.editing_filter_idx = None # (channel_idx, filter_idx) or None
 
-        title_label = ctk.CTkLabel(
-            self.left_frame,
-            text="Ross Filter Calculator",
-            font=ctk.CTkFont(size=20, weight="bold"),
-        )
-        title_label.grid(row=0, column=0, padx=20, pady=(20, 10))
+        # Main Layout
+        self.window.grid_columnconfigure(1, weight=1)
+        self.window.grid_rowconfigure(0, weight=1)
 
-        self.materials_frame = ctk.CTkFrame(self.left_frame)
-        self.materials_frame.grid(row=1, column=0, padx=10, pady=10, sticky="ew")
-        self._setup_materials_frame()
+        self.left_panel = ctk.CTkFrame(self.window, width=400, corner_radius=0)
+        self.left_panel.grid(row=0, column=0, sticky="nsew")
+        self.left_panel.grid_propagate(False)
 
-        self.energy_frame = ctk.CTkFrame(self.left_frame)
-        self.energy_frame.grid(row=2, column=0, padx=10, pady=10, sticky="ew")
-        self._setup_energy_frame()
+        self.right_panel = ctk.CTkFrame(self.window, corner_radius=0)
+        self.right_panel.grid(row=0, column=1, sticky="nsew")
 
-        self.transmission_frame = ctk.CTkFrame(self.left_frame)
-        self.transmission_frame.grid(row=3, column=0, padx=10, pady=10, sticky="ew")
-        self._setup_transmission_frame()
+        self._setup_left_panel()
+        self._setup_right_panel()
+        
+        # Initial state
+        self._refresh_channel_list()
+        self._update_filter_creator_state()
 
-        self.output_frame = ctk.CTkFrame(self.left_frame)
-        self.output_frame.grid(row=4, column=0, padx=10, pady=10, sticky="ew")
-        self._setup_output_frame()
+    def _setup_left_panel(self):
+        self.left_panel.grid_columnconfigure(0, weight=1)
+        self.left_panel.grid_rowconfigure(2, weight=1) # Channel list expands
 
-    def _setup_materials_frame(self):
-        self.materials_frame.grid_columnconfigure(1, weight=1)
+        # 1. Energy Settings
+        self.energy_frame = ctk.CTkFrame(self.left_panel)
+        self.energy_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
+        self._setup_energy_controls()
 
-        materials_title = ctk.CTkLabel(
-            self.materials_frame,
-            text="Materials",
-            font=ctk.CTkFont(size=16, weight="bold"),
-        )
-        materials_title.grid(row=0, column=0, columnspan=2, padx=10, pady=5, sticky="w")
+        # 2. Channel Management Header
+        self.channel_header_frame = ctk.CTkFrame(self.left_panel, fg_color="transparent")
+        self.channel_header_frame.grid(row=1, column=0, padx=10, pady=(10, 0), sticky="ew")
+        
+        lbl = ctk.CTkLabel(self.channel_header_frame, text="Channels", font=ctk.CTkFont(size=16, weight="bold"))
+        lbl.pack(side="left")
+        
+        add_btn = ctk.CTkButton(self.channel_header_frame, text="+ Add Channel", width=100, command=self._add_channel)
+        add_btn.pack(side="right")
 
-        show_materials_button = ctk.CTkButton(
-            self.materials_frame,
-            text="Show Available Materials",
-            width=200,
-            command=self._show_materials_list,
-        )
-        show_materials_button.grid(row=1, column=0, columnspan=2, padx=10, pady=5)
+        # 3. Channel List
+        self.channel_list_frame = ctk.CTkScrollableFrame(self.left_panel)
+        self.channel_list_frame.grid(row=2, column=0, padx=10, pady=5, sticky="nsew")
 
-        materials = get_material_list()
+        # 4. Filter Creator
+        self.filter_creator_frame = ctk.CTkFrame(self.left_panel)
+        self.filter_creator_frame.grid(row=3, column=0, padx=10, pady=10, sticky="ew")
+        self._setup_filter_creator()
 
-        filter1_label = ctk.CTkLabel(self.materials_frame, text="Filter 1:", font=ctk.CTkFont(size=14))
-        filter1_label.grid(row=2, column=0, padx=10, pady=5, sticky="w")
+        # 5. Actions
+        self.action_frame = ctk.CTkFrame(self.left_panel, fg_color="transparent")
+        self.action_frame.grid(row=4, column=0, padx=10, pady=10, sticky="ew")
+        
+        self.calc_btn = ctk.CTkButton(self.action_frame, text="Calculate Transmission", height=40, command=self._calculate)
+        self.calc_btn.pack(side="left", expand=True, fill="x", padx=(0, 5))
+        
+        self.reset_btn = ctk.CTkButton(self.action_frame, text="Reset", width=80, height=40, fg_color="darkred", hover_color="red", command=self._reset)
+        self.reset_btn.pack(side="right", padx=(5, 0))
 
-        self.material1_var = ctk.StringVar(value="Select Material")
-        self.material1_dropdown = AutocompleteComboBox(
-            self.materials_frame,
-            values=materials,
-            variable=self.material1_var,
-            width=200,
-            placeholder="Select Material",
-        )
-        self.material1_dropdown.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
+        # 6. Console
+        self.console = ctk.CTkTextbox(self.left_panel, height=120, font=ctk.CTkFont(size=12))
+        self.console.grid(row=5, column=0, padx=10, pady=10, sticky="ew")
+        self.console.insert("1.0", "Welcome to Ross Filter Calculator.\nAdd channels and filters to begin.\n")
 
-        thickness1_label = ctk.CTkLabel(
-            self.materials_frame,
-            text="Thickness (µm):",
-            font=ctk.CTkFont(size=14),
-        )
-        thickness1_label.grid(row=3, column=0, padx=10, pady=5, sticky="w")
+    def _setup_energy_controls(self):
+        self.energy_frame.grid_columnconfigure((1, 3, 5), weight=1)
+        
+        ctk.CTkLabel(self.energy_frame, text="Energy (keV)", font=ctk.CTkFont(weight="bold")).grid(row=0, column=0, columnspan=6, pady=5)
+        
+        ctk.CTkLabel(self.energy_frame, text="Start:").grid(row=1, column=0, padx=5)
+        self.energy_start = ctk.CTkEntry(self.energy_frame, width=60)
+        self.energy_start.insert(0, "0.1")
+        self.energy_start.grid(row=1, column=1, padx=5, pady=5, sticky="ew")
+        
+        ctk.CTkLabel(self.energy_frame, text="Stop:").grid(row=1, column=2, padx=5)
+        self.energy_stop = ctk.CTkEntry(self.energy_frame, width=60)
+        self.energy_stop.insert(0, "50.0")
+        self.energy_stop.grid(row=1, column=3, padx=5, pady=5, sticky="ew")
+        
+        ctk.CTkLabel(self.energy_frame, text="Step:").grid(row=1, column=4, padx=5)
+        self.energy_step = ctk.CTkEntry(self.energy_frame, width=60)
+        self.energy_step.insert(0, "0.5")
+        self.energy_step.grid(row=1, column=5, padx=5, pady=5, sticky="ew")
 
-        thickness1_frame = ctk.CTkFrame(self.materials_frame)
-        thickness1_frame.grid(row=3, column=1, padx=10, pady=5, sticky="ew")
-        thickness1_frame.grid_columnconfigure(0, weight=1)
+    def _setup_filter_creator(self):
+        self.filter_creator_frame.grid_columnconfigure(1, weight=1)
+        
+        self.creator_label = ctk.CTkLabel(self.filter_creator_frame, text="Add Filter", font=ctk.CTkFont(weight="bold"))
+        self.creator_label.grid(row=0, column=0, columnspan=2, pady=5)
+        
+        ctk.CTkLabel(self.filter_creator_frame, text="Material:").grid(row=1, column=0, padx=10, sticky="w")
+        self.material_combo = AutocompleteComboBox(self.filter_creator_frame, values=get_material_list())
+        self.material_combo.grid(row=1, column=1, padx=10, pady=5, sticky="ew")
+        
+        ctk.CTkLabel(self.filter_creator_frame, text="Thickness (µm):").grid(row=2, column=0, padx=10, sticky="w")
+        self.thickness_var = ctk.StringVar(value="0.0")
+        self.thickness_entry = ctk.CTkEntry(self.filter_creator_frame, textvariable=self.thickness_var)
+        self.thickness_entry.grid(row=2, column=1, padx=10, pady=5, sticky="ew")
 
-        self.thickness1_var = StringVar(value="0.0")
-        self.thickness1_entry = ctk.CTkEntry(thickness1_frame, textvariable=self.thickness1_var, width=160)
-        self.thickness1_entry.grid(row=0, column=0, sticky="ew")
+        ctk.CTkLabel(self.filter_creator_frame, text="Density (g/cm³):").grid(row=3, column=0, padx=10, sticky="w")
+        self.density_var = ctk.StringVar(value="")
+        self.density_entry = ctk.CTkEntry(self.filter_creator_frame, textvariable=self.density_var, placeholder_text="Optional")
+        self.density_entry.grid(row=3, column=1, padx=10, pady=5, sticky="ew")
+        
+        # Buttons
+        btn_frame = ctk.CTkFrame(self.filter_creator_frame, fg_color="transparent")
+        btn_frame.grid(row=4, column=0, columnspan=2, pady=10, sticky="ew")
+        btn_frame.grid_columnconfigure((0, 1), weight=1)
+        
+        self.preview_btn = ctk.CTkButton(btn_frame, text="Preview", command=self._preview_filter, fg_color="gray")
+        self.preview_btn.grid(row=0, column=0, padx=5, sticky="ew")
+        
+        self.add_filter_btn = ctk.CTkButton(btn_frame, text="Add Filter", command=self._add_filter)
+        self.add_filter_btn.grid(row=0, column=1, padx=5, sticky="ew")
 
-        buttons_frame1 = ctk.CTkFrame(thickness1_frame)
-        buttons_frame1.grid(row=0, column=1, padx=(5, 0))
+    def _setup_right_panel(self):
+        self.right_panel.grid_rowconfigure(0, weight=1)
+        self.right_panel.grid_columnconfigure(0, weight=1)
 
-        up_button1 = ctk.CTkButton(
-            buttons_frame1,
-            text="↑",
-            width=10,
-            height=5,
-            command=lambda: self._adjust_thickness(self.thickness1_var, 0.1),
-        )
-        up_button1.grid(row=0, column=0)
+        self.plot_manager = PlotManager(self.right_panel)
+        self.plot_manager.widget.grid(row=0, column=0, sticky="nsew")
 
-        down_button1 = ctk.CTkButton(
-            buttons_frame1,
-            text="↓",
-            width=10,
-            height=5,
-            command=lambda: self._adjust_thickness(self.thickness1_var, -0.1),
-        )
-        down_button1.grid(row=1, column=0)
+    def _log(self, msg):
+        self.console.insert("end", f"{msg}\n")
+        self.console.see("end")
 
-        filter1_buttons_frame = ctk.CTkFrame(self.materials_frame)
-        filter1_buttons_frame.grid(row=4, column=0, columnspan=2, padx=10, pady=10)
+    def _add_channel(self):
+        idx = self.calculator.add_channel()
+        self._log(f"Added Channel {idx + 1}")
+        self.selected_channel_idx = idx
+        self._refresh_channel_list()
+        self._update_filter_creator_state()
 
-        add_filter1_button = ctk.CTkButton(
-            filter1_buttons_frame,
-            text="Add Filter 1",
-            width=120,
-            command=lambda: self._add_filter(1, self.material1_var.get(), self.thickness1_var.get(), "Filter 1"),
-        )
-        add_filter1_button.grid(row=0, column=0, padx=5)
+    def _select_channel(self, idx):
+        self.selected_channel_idx = idx
+        self.editing_filter_idx = None
+        self._refresh_channel_list() # To update selection visuals
+        self._update_filter_creator_state()
 
-        modify_filter1_button = ctk.CTkButton(
-            filter1_buttons_frame,
-            text="Modify Filter 1",
-            width=120,
-            command=lambda: self._modify_filter(1),
-        )
-        modify_filter1_button.grid(row=0, column=1, padx=5)
+    def _refresh_channel_list(self):
+        existing_vars = self.selection_vars
+        present_keys = set()
 
-        filter2_label = ctk.CTkLabel(self.materials_frame, text="Filter 2:", font=ctk.CTkFont(size=14))
-        filter2_label.grid(row=5, column=0, padx=10, pady=5, sticky="w")
+        for widget in self.channel_list_frame.winfo_children():
+            widget.destroy()
 
-        self.material2_var = ctk.StringVar(value="Select Material")
-        self.material2_dropdown = AutocompleteComboBox(
-            self.materials_frame,
-            values=materials,
-            variable=self.material2_var,
-            width=200,
-            placeholder="Select Material",
-        )
-        self.material2_dropdown.grid(row=5, column=1, padx=10, pady=5, sticky="ew")
-
-        thickness2_label = ctk.CTkLabel(
-            self.materials_frame,
-            text="Thickness (µm):",
-            font=ctk.CTkFont(size=14),
-        )
-        thickness2_label.grid(row=6, column=0, padx=10, pady=5, sticky="w")
-
-        thickness2_frame = ctk.CTkFrame(self.materials_frame)
-        thickness2_frame.grid(row=6, column=1, padx=10, pady=5, sticky="ew")
-        thickness2_frame.grid_columnconfigure(0, weight=1)
-
-        self.thickness2_var = StringVar(value="0.0")
-        self.thickness2_entry = ctk.CTkEntry(thickness2_frame, textvariable=self.thickness2_var, width=160)
-        self.thickness2_entry.grid(row=0, column=0, sticky="ew")
-
-        buttons_frame2 = ctk.CTkFrame(thickness2_frame)
-        buttons_frame2.grid(row=0, column=1, padx=(5, 0))
-
-        up_button2 = ctk.CTkButton(
-            buttons_frame2,
-            text="↑",
-            width=10,
-            height=5,
-            command=lambda: self._adjust_thickness(self.thickness2_var, 0.1),
-        )
-        up_button2.grid(row=0, column=0)
-
-        down_button2 = ctk.CTkButton(
-            buttons_frame2,
-            text="↓",
-            width=10,
-            height=5,
-            command=lambda: self._adjust_thickness(self.thickness2_var, -0.1),
-        )
-        down_button2.grid(row=1, column=0)
-
-        filter2_buttons_frame = ctk.CTkFrame(self.materials_frame)
-        filter2_buttons_frame.grid(row=7, column=0, columnspan=2, padx=10, pady=10)
-
-        add_filter2_button = ctk.CTkButton(
-            filter2_buttons_frame,
-            text="Add Filter 2",
-            width=120,
-            command=lambda: self._add_filter(2, self.material2_var.get(), self.thickness2_var.get(), "Filter 2"),
-        )
-        add_filter2_button.grid(row=0, column=0, padx=5)
-
-        modify_filter2_button = ctk.CTkButton(
-            filter2_buttons_frame,
-            text="Modify Filter 2",
-            width=120,
-            command=lambda: self._modify_filter(2),
-        )
-        modify_filter2_button.grid(row=0, column=1, padx=5)
-
-    def _modify_filter(self, filter_num):
-        filter_instance = self.calculator.filter1 if filter_num == 1 else self.calculator.filter2
-        material_var = self.material1_var if filter_num == 1 else self.material2_var
-        thickness_var = self.thickness1_var if filter_num == 1 else self.thickness2_var
-
-        if not filter_instance.materials:
-            self.print_to_console(f"Filter {filter_num} is empty. Nothing to modify.")
-            return
-
-        current_material = material_var.get()
-        if current_material not in filter_instance.materials:
-            self.print_to_console(f"Material '{current_material}' not found in Filter {filter_num}")
-            return
-
-        try:
-            material_index = filter_instance.materials.index(current_material)
-            filter_instance.thicknesses[material_index] = um_to_cm(float(thickness_var.get()))
-            self.print_to_console(
-                f"Filter {filter_num}: Modified {current_material} thickness to {thickness_var.get()} µm"
+        for i, channel in enumerate(self.calculator.channels):
+            cw = ChannelWidget(
+                self.channel_list_frame, 
+                channel_idx=i, 
+                channel=channel, 
+                on_select_callback=self._select_channel,
+                on_delete_channel_callback=self._delete_channel,
+                on_edit_filter_callback=self._edit_filter,
+                on_delete_filter_callback=self._delete_filter,
+                selection_vars=existing_vars,
+                on_selection_change=self._on_selection_changed,
+                is_selected=(i == self.selected_channel_idx)
             )
-        except ValueError as e:
-            self.print_to_console(f"Error modifying Filter {filter_num}: {str(e)}")
+            cw.pack(fill="x", pady=2)
 
-    def _add_filter(self, filter_num, material, thickness_str, filter_name):
-        success, message = self.calculator.add_material_to_filter(filter_num, material, float(thickness_str))
-        if success:
-            self.print_to_console(f"{filter_name}: Added {material} with thickness {thickness_str} µm")
+            present_keys.add(("channel", i))
+            for f_idx in range(len(channel.filters)):
+                present_keys.add(("filter", i, f_idx))
+
+        # Drop vars for items that no longer exist
+        for key in list(existing_vars.keys()):
+            if key not in present_keys:
+                existing_vars.pop(key, None)
+
+        self.selection_vars = existing_vars
+
+    def _update_filter_creator_state(self):
+        if self.selected_channel_idx >= 0 and self.selected_channel_idx < len(self.calculator.channels):
+            if self.editing_filter_idx:
+                self.creator_label.configure(text=f"Edit Filter (Ch {self.editing_filter_idx[0]+1}, Flt {self.editing_filter_idx[1]+1})")
+                self.add_filter_btn.configure(text="Update Filter", state="normal")
+            else:
+                self.creator_label.configure(text=f"Add Filter to Channel {self.selected_channel_idx + 1}")
+                self.add_filter_btn.configure(text="Add Filter", state="normal")
+                
+            self.material_combo.configure(state="normal")
+            self.thickness_entry.configure(state="normal")
+            self.density_entry.configure(state="normal")
+            self.preview_btn.configure(state="normal")
         else:
-            self.print_to_console(f"{filter_name} Error: {message}")
+            self.creator_label.configure(text="Select a Channel to Add Filter")
+            self.material_combo.configure(state="disabled")
+            self.thickness_entry.configure(state="disabled")
+            self.density_entry.configure(state="disabled")
+            self.preview_btn.configure(state="disabled")
+            self.add_filter_btn.configure(state="disabled")
 
-    def _show_materials_list(self):
-        materials_window = ctk.CTkToplevel(self.window)
-        materials_window.title("Available Materials")
-        materials_window.geometry("400x510")
-
-        materials_window.transient(self.window)
-        materials_window.grab_set()
-        materials_window.lift()
-
-        x = self.window.winfo_x() + (self.window.winfo_width() - 400) // 2
-        y = self.window.winfo_y() + (self.window.winfo_height() - 500) // 2
-        materials_window.geometry(f"+{x}+{y}")
-
-        title = ctk.CTkLabel(
-            materials_window,
-            text="Available Materials",
-            font=ctk.CTkFont(size=16, weight="bold"),
-        )
-        title.pack(pady=10)
-
-        textbox = ctk.CTkTextbox(materials_window, width=350, height=400)
-        textbox.pack(padx=20, pady=10)
-
-        materials_text = "\n".join(sorted(get_material_list()))
-        textbox.insert("1.0", materials_text)
-        textbox.configure(state="disabled")
-
-        close_button = ctk.CTkButton(materials_window, text="Close", width=100, command=materials_window.destroy)
-        close_button.pack(pady=10)
-
-    def _adjust_thickness(self, var: StringVar, delta: float):
+    def _add_filter(self):
+        if self.selected_channel_idx < 0:
+            return
+            
+        material = self.material_combo.get()
         try:
-            current = float(var.get())
-            new_value = max(0, min(100, current + delta))
-            var.set(f"{new_value:.1f}")
+            thickness = float(self.thickness_var.get())
         except ValueError:
-            var.set("0.0")
-
-    def _setup_energy_frame(self):
-        energy_title = ctk.CTkLabel(
-            self.energy_frame,
-            text="Energy Range (keV)",
-            font=ctk.CTkFont(size=16, weight="bold"),
-        )
-        energy_title.grid(row=0, column=0, columnspan=6, padx=10, pady=5, sticky="w")
-
-        start_label = ctk.CTkLabel(self.energy_frame, text="Start:", font=ctk.CTkFont(size=14))
-        start_label.grid(row=1, column=0, padx=3, pady=5)
-        self.energy_start_var = StringVar(value="0.001")
-        self.energy_start_entry = ctk.CTkEntry(self.energy_frame, textvariable=self.energy_start_var, width=90)
-        self.energy_start_entry.grid(row=1, column=1, padx=3, pady=5)
-
-        stop_label = ctk.CTkLabel(self.energy_frame, text="Stop:", font=ctk.CTkFont(size=14))
-        stop_label.grid(row=1, column=2, padx=3, pady=5)
-        self.energy_stop_var = StringVar(value="50.0")
-        self.energy_stop_entry = ctk.CTkEntry(self.energy_frame, textvariable=self.energy_stop_var, width=90)
-        self.energy_stop_entry.grid(row=1, column=3, padx=3, pady=5)
-
-        step_label = ctk.CTkLabel(self.energy_frame, text="Step:", font=ctk.CTkFont(size=14))
-        step_label.grid(row=1, column=4, padx=3, pady=5)
-        self.energy_step_var = StringVar(value="0.5")
-        self.energy_step_entry = ctk.CTkEntry(self.energy_frame, textvariable=self.energy_step_var, width=90)
-        self.energy_step_entry.grid(row=1, column=5, padx=3, pady=5)
-
-    def _setup_transmission_frame(self):
-        self.transmission_frame.grid_columnconfigure((0, 1), weight=1)
-
-        transmission_title = ctk.CTkLabel(
-            self.transmission_frame,
-            text="Transmission Calculation",
-            font=ctk.CTkFont(size=16, weight="bold"),
-        )
-        transmission_title.grid(row=0, column=0, columnspan=2, padx=10, pady=5, sticky="w")
-
-        button_frame = ctk.CTkFrame(self.transmission_frame)
-        button_frame.grid(row=1, column=0, columnspan=2, padx=10, pady=10)
-
-        calculate_button = ctk.CTkButton(
-            button_frame,
-            text="Calculate Transmission",
-            width=200,
-            command=self._calculate_transmission,
-        )
-        calculate_button.grid(row=0, column=0, padx=5, pady=10)
-
-        reset_button = ctk.CTkButton(
-            button_frame,
-            text="Reset",
-            width=100,
-            command=self._reset_all,
-            fg_color="darkred",
-            hover_color="red",
-        )
-        reset_button.grid(row=0, column=1, padx=5, pady=10)
-
-        save_button = ctk.CTkButton(
-            button_frame,
-            text="Save Figure",
-            width=100,
-            command=self._save_figure,
-            fg_color="darkgreen",
-            hover_color="green",
-        )
-        save_button.grid(row=0, column=2, padx=5, pady=10)
-
-    def _save_figure(self):
+            self._log("Error: Invalid thickness")
+            return
+        
+        density_str = self.density_var.get().strip()
         try:
-            initialdir = os.getcwd()
-            initialfile = "figure"
+            density = float(density_str) if density_str else None
+        except ValueError:
+            self._log("Error: Invalid density")
+            return
 
-            file_path = ctk.filedialog.asksaveasfilename(
-                defaultextension=".png",
-                initialdir=initialdir,
-                initialfile=initialfile,
-                filetypes=[("PNG files", "*.png"), ("PDF files", "*.pdf"), ("SVG files", "*.svg")],
-                title="Save Figure As",
-            )
-
-            if file_path:
-                self.figure.savefig(file_path, dpi=300, bbox_inches="tight")
-                self.print_to_console(f"Figure saved successfully to: {file_path}")
-        except Exception as e:
-            self.print_to_console(f"Error saving figure: {str(e)}")
-
-    def _reset_all(self):
-        try:
-            success, message = self.calculator.reset()
+        if self.editing_filter_idx:
+            # Update existing
+            c_idx, f_idx = self.editing_filter_idx
+            success, msg = self.calculator.update_filter_in_channel(c_idx, f_idx, material, thickness, density)
             if success:
-                self.material1_var.set("Select Material")
-                self.material2_var.set("Select Material")
-                self.thickness1_var.set("0.0")
-                self.thickness2_var.set("0.0")
-                self._initialize_plot()
-                self.print_to_console("Reset successful - All filters cleared")
+                self._log(f"Updated Filter in Channel {c_idx + 1}")
+                self.editing_filter_idx = None # Exit edit mode
             else:
-                self.print_to_console(f"Reset failed: {message}")
-        except Exception as e:
-            self.print_to_console(f"Reset error: {str(e)}")
-
-    def _calculate_transmission(self):
-        try:
-            success, result = self.calculator.calculate_transmission(
-                self.energy_start_var.get(),
-                self.energy_stop_var.get(),
-                self.energy_step_var.get(),
-            )
-
+                self._log(f"Error: {msg}")
+        else:
+            # Add new
+            success, msg = self.calculator.add_filter_to_channel(self.selected_channel_idx, material, thickness, density)
             if success:
-                self.plot.clear()
-                energies = result["energies"]
-
-                if "transmission1" in result:
-                    self.plot.plot(energies / 1e3, result["transmission1"], label="Filter 1", color="blue")
-                if "transmission2" in result:
-                    self.plot.plot(energies / 1e3, result["transmission2"], label="Filter 2", color="red")
-                if "difference" in result:
-                    self.plot.plot(
-                        energies / 1e3,
-                        result["difference"],
-                        label="Difference",
-                        linestyle="--",
-                        color="green",
-                    )
-
-                self.plot.set_xlabel("Energy (keV)")
-                self.plot.set_ylabel("Transmission")
-                self.plot.set_title("Ross Filter Transmission")
-                self.plot.grid(True)
-                self.plot.legend()
-                self.canvas.draw()
-                self.print_to_console("Transmission calculation completed successfully")
+                self._log(f"Added {material} ({thickness} µm) to Channel {self.selected_channel_idx + 1}")
             else:
-                self.print_to_console(f"Calculation Error: {result}")
+                self._log(f"Error: {msg}")
+
+        if success:
+            self._refresh_channel_list()
+            self._update_filter_creator_state()
+            self._plot_selected_series()
+
+    def _get_energy_range(self):
+        try:
+            start = float(self.energy_start.get())
+            stop = float(self.energy_stop.get())
+            step = float(self.energy_step.get())
+            return start, stop, step
+        except ValueError:
+            return None
+
+    def _delete_channel(self, channel_idx):
+        success, msg = self.calculator.remove_channel(channel_idx)
+        if success:
+            self._log(msg)
+            if self.selected_channel_idx == channel_idx:
+                self.selected_channel_idx = -1
+            elif self.selected_channel_idx > channel_idx:
+                self.selected_channel_idx -= 1
+            self._refresh_channel_list()
+            self._update_filter_creator_state()
+        else:
+            self._log(f"Error: {msg}")
+
+    def _delete_filter(self, channel_idx, filter_idx):
+        success, msg = self.calculator.remove_filter_from_channel(channel_idx, filter_idx)
+        if success:
+            self._log(msg)
+            self._refresh_channel_list()
+            self._plot_selected_series()
+        else:
+            self._log(f"Error: {msg}")
+
+    def _edit_filter(self, channel_idx, filter_idx):
+        self.selected_channel_idx = channel_idx
+        self.editing_filter_idx = (channel_idx, filter_idx)
+        
+        channel = self.calculator.channels[channel_idx]
+        flt = channel.filters[filter_idx]
+        
+        self.material_combo.set(flt.material)
+        self.thickness_var.set(str(flt.thickness * 1e4)) # cm to um
+        self.density_var.set(str(flt.density) if flt.density else "")
+        
+        self._refresh_channel_list()
+        self._update_filter_creator_state()
+        self._log(f"Editing Filter {filter_idx + 1} in Channel {channel_idx + 1}")
+
+    def _preview_filter(self):
+        # Calculate transmission for just this filter
+        material = self.material_combo.get()
+        try:
+            thickness_um = float(self.thickness_var.get())
+            thickness_cm = um_to_cm(thickness_um)
+        except ValueError:
+            self._log("Error: Invalid thickness")
+            return
+
+        density_str = self.density_var.get().strip()
+        try:
+            density = float(density_str) if density_str else None
+        except ValueError:
+            self._log("Error: Invalid density")
+            return
+
+        erange = self._get_energy_range()
+        if not erange:
+            self._log("Error: Invalid energy range")
+            return
+        
+        start, stop, step = erange
+        energies_kev = np.arange(start, stop + step, step)
+        energies_ev = kev_to_ev(energies_kev)
+        
+        try:
+            # Create a temporary filter to calc transmission
+            # We can use the Channel logic or direct calculation
+            energies_ev = np.asarray(energies_ev)  # Ensure it's always an array
+            mu = np.array([xraydb.material_mu(material, e, density=density) for e in energies_ev])
+            transmission = np.exp(-mu * thickness_cm)
+            
+            self.plot_manager.clear(title="Preview")
+            self.plot_manager.plot_series(energies_kev, transmission, label='Preview', style='--', color='gray', alpha=0.7)
+            self.plot_manager.draw()
+            self._log(f"Previewing {material} ({thickness_um} µm)")
+            
         except Exception as e:
-            self.print_to_console(f"Error: {str(e)}")
+            self._log(f"Preview Error: {str(e)}")
 
-    def _setup_output_frame(self):
-        self.output_frame.grid_columnconfigure(0, weight=1)
+    def _calculate(self):
+        erange = self._get_energy_range()
+        if not erange:
+            self._log("Error: Invalid energy range")
+            return
+            
+        success, result = self.calculator.calculate_transmission(*erange)
+        
+        if success:
+            energies_kev = result.energies_ev / 1000.0
 
-        output_title = ctk.CTkLabel(
-            self.output_frame,
-            text="Output Console",
-            font=ctk.CTkFont(size=16, weight="bold"),
-        )
-        output_title.grid(row=0, column=0, padx=10, pady=5, sticky="w")
+            self.plot_manager.clear(title="Ross Filter Transmission")
+            
+            for i, trans in enumerate(result.transmissions):
+                self.plot_manager.plot_series(energies_kev, trans, label=f"Ch {i+1}")
+                
+            for i, diff in enumerate(result.differences):
+                self.plot_manager.plot_series(energies_kev, diff, style='--', label=f"Diff {i+1}-{i+2}")
+                self.plot_manager.fill_between(energies_kev, diff, alpha=0.2)
 
-        self.output_console = ctk.CTkTextbox(
-            self.output_frame,
-            width=380,
-            height=150,
-            font=ctk.CTkFont(size=12),
-        )
-        self.output_console.grid(row=1, column=0, padx=10, pady=5, sticky="ew")
+            self.plot_manager.draw()
+            self._log("Calculation complete.")
+        else:
+            self._log(f"Error: {result}")
 
-        clear_button = ctk.CTkButton(self.output_frame, text="Clear Console", width=120, command=self._clear_console)
-        clear_button.grid(row=2, column=0, padx=10, pady=10)
+    def _reset(self):
+        self.calculator.reset()
+        self.selected_channel_idx = -1
+        self.editing_filter_idx = None
+        self._refresh_channel_list()
+        self._update_filter_creator_state()
+        self.plot_manager.clear(title="Ross Filter Transmission")
+        self.plot_manager.draw()
+        self._log("Reset all channels.")
 
-    def _clear_console(self):
-        self.output_console.delete("1.0", "end")
+    def _on_selection_changed(self, *args):
+        self._plot_selected_series()
 
-    def print_to_console(self, message):
-        self.output_console.insert("end", f"{message}\n")
-        self.output_console.see("end")
+    def _plot_selected_series(self):
+        erange = self._get_energy_range()
+        if not erange:
+            self._log("Error: Invalid energy range")
+            return
 
-    def _setup_right_frame(self):
-        self.figure = Figure(figsize=(6, 4), dpi=100)
-        self.plot = self.figure.add_subplot(111)
+        start, stop, step = erange
+        energies_kev = np.arange(start, stop + step, step)
+        energies_ev = kev_to_ev(energies_kev)
 
-        self.canvas = FigureCanvasTkAgg(self.figure, master=self.right_frame)
-        self.canvas.draw()
-        self.canvas.get_tk_widget().pack(fill="both", expand=True, padx=10, pady=10)
+        try:
+            selected = [key for key, var in self.selection_vars.items() if var.get()]
+            self.plot_manager.clear(title="Selected Transmissions")
 
-        self._initialize_plot()
+            for key in selected:
+                if key[0] == "channel":
+                    c_idx = key[1]
+                    channel = self.calculator.channels[c_idx]
+                    transmission = channel.calculate_transmission(energies_ev)
+                    label = f"Channel {c_idx + 1}"
+                else:
+                    c_idx, f_idx = key[1], key[2]
+                    channel = self.calculator.channels[c_idx]
+                    transmission = channel.calculate_single_filter(f_idx, energies_ev)
+                    flt = channel.filters[f_idx]
+                    label = f"Ch {c_idx + 1}: {flt.material}"
 
-    def _initialize_plot(self):
-        self.plot.clear()
-        self.plot.set_xlabel("Energy (keV)")
-        self.plot.set_ylabel("Transmission")
-        self.plot.set_title("Ross Filter Transmission")
-        self.plot.grid(True)
-        self.canvas.draw()
+                self.plot_manager.plot_series(energies_kev, transmission, label=label)
+
+            self.plot_manager.draw()
+        except Exception as e:
+            self._log(f"Plot Error: {str(e)}")
 
     def run(self):
         self.window.mainloop()

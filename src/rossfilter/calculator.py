@@ -1,60 +1,100 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
-from .filter import Filter
+from .filter import Channel
 from .units import kev_to_ev, um_to_cm
 
 
 @dataclass
 class TransmissionResult:
     energies_ev: np.ndarray
-    transmission1: np.ndarray | None = None
-    transmission2: np.ndarray | None = None
-    difference: np.ndarray | None = None
+    transmissions: list[np.ndarray] = field(default_factory=list)
+    differences: list[np.ndarray] = field(default_factory=list)
 
 
 class RossFilterCalculator:
     def __init__(self):
-        self.filter1 = Filter()
-        self.filter2 = Filter()
+        self.channels: list[Channel] = []
 
     def reset(self):
-        """Reset both filters to empty state."""
-        self.filter1 = Filter()
-        self.filter2 = Filter()
-        return True, "Filters reset successfully"
+        """Reset all channels."""
+        self.channels = []
+        return True, "All channels reset successfully"
 
-    def add_material_to_filter(self, filter_num: int, material: str, thickness_um: float):
-        """Add a layer to one of the two filters.
+    def add_channel(self) -> int:
+        """Add a new empty channel.
+        
+        Returns:
+            index of the new channel
+        """
+        self.channels.append(Channel())
+        return len(self.channels) - 1
+
+    def remove_channel(self, channel_idx: int):
+        """Remove a channel by index."""
+        if 0 <= channel_idx < len(self.channels):
+            self.channels.pop(channel_idx)
+            return True, f"Removed Channel {channel_idx + 1}"
+        return False, f"Invalid channel index {channel_idx}"
+
+    def add_filter_to_channel(self, channel_idx: int, material: str, thickness_um: float, density: float | None = None):
+        """Add a filter layer to a specific channel.
 
         Args:
-            filter_num: 1 or 2
+            channel_idx: Index of the channel (0-based)
             material: xraydb material name
             thickness_um: thickness in micrometers (µm)
+            density: density in g/cm^3 (optional)
         """
-        filter_instance = self.filter1 if filter_num == 1 else self.filter2
+        if not (0 <= channel_idx < len(self.channels)):
+             return False, f"Invalid channel index {channel_idx}"
+
+        channel = self.channels[channel_idx]
 
         if material in ["Select Material", ""]:
-            return False, f"Please select a material for Filter {filter_num}"
+            return False, f"Please select a material for Channel {channel_idx + 1}"
 
         try:
             thickness_cm = um_to_cm(thickness_um)
-            return filter_instance.add_material(material, thickness_cm)
+            return channel.add_filter(material, thickness_cm, density)
+        except ValueError:
+            return False, "Invalid thickness value"
+
+    def remove_filter_from_channel(self, channel_idx: int, filter_idx: int):
+        """Remove a filter from a specific channel."""
+        if not (0 <= channel_idx < len(self.channels)):
+             return False, f"Invalid channel index {channel_idx}"
+        
+        channel = self.channels[channel_idx]
+        success, msg = channel.remove_filter(filter_idx)
+        if success:
+            return True, f"Removed filter from Channel {channel_idx + 1}"
+        return False, msg
+
+    def update_filter_in_channel(self, channel_idx: int, filter_idx: int, material: str, thickness_um: float, density: float | None = None):
+        """Update a filter in a specific channel."""
+        if not (0 <= channel_idx < len(self.channels)):
+             return False, f"Invalid channel index {channel_idx}"
+
+        channel = self.channels[channel_idx]
+        try:
+            thickness_cm = um_to_cm(thickness_um)
+            return channel.update_filter(filter_idx, material, thickness_cm, density)
         except ValueError:
             return False, "Invalid thickness value"
 
     def calculate_transmission(self, energy_start_kev, energy_stop_kev, energy_step_kev):
-        """Calculate transmission for available filters across an energy range.
+        """Calculate transmission for all channels and sequential differences.
 
         GUI inputs are in keV; internal computations are in eV.
         """
         try:
-            start_ev = kev_to_ev(float(energy_start_kev))
-            stop_ev = kev_to_ev(float(energy_stop_kev))
-            step_ev = kev_to_ev(float(energy_step_kev))
+            start_ev = float(kev_to_ev(float(energy_start_kev)))
+            stop_ev = float(kev_to_ev(float(energy_stop_kev)))
+            step_ev = float(kev_to_ev(float(energy_step_kev)))
 
             if start_ev >= stop_ev:
                 return False, "Start energy must be less than stop energy"
@@ -63,22 +103,26 @@ class RossFilterCalculator:
             if start_ev < 0:
                 return False, "Start energy must be positive"
 
-            filter1_empty = len(self.filter1.materials) == 0
-            filter2_empty = len(self.filter2.materials) == 0
-            if filter1_empty and filter2_empty:
-                return False, "No filters added. Please add at least one filter."
+            if not self.channels:
+                return False, "No channels added."
 
-            energies = np.arange(start_ev, stop_ev + step_ev, step_ev, dtype=np.float64)
-            result: dict[str, object] = {"energies": energies}
+            energies = np.arange(start_ev, stop_ev + step_ev, step_ev)
+            
+            transmissions = []
+            for channel in self.channels:
+                transmissions.append(channel.calculate_transmission(energies))
+            
+            differences = []
+            # Calculate sequential differences: Ch1-Ch2, Ch2-Ch3, etc.
+            for i in range(len(transmissions) - 1):
+                diff = np.abs(transmissions[i] - transmissions[i+1])
+                differences.append(diff)
 
-            if not filter1_empty:
-                result["transmission1"] = self.filter1.calculate_transmission(energies)
-            if not filter2_empty:
-                result["transmission2"] = self.filter2.calculate_transmission(energies)
-            if not filter1_empty and not filter2_empty:
-                result["difference"] = np.abs(
-                    np.asarray(result["transmission1"]) - np.asarray(result["transmission2"])
-                )
+            result = TransmissionResult(
+                energies_ev=energies,
+                transmissions=transmissions,
+                differences=differences
+            )
 
             return True, result
 

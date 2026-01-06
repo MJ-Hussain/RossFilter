@@ -2,7 +2,7 @@ import customtkinter as ctk
 
 
 class PlotSelectionPanel(ctk.CTkFrame):
-    """Checkbox-based series selector for channels and filters."""
+    """Checkbox-based series selector for channels, filters, and differences."""
 
     def __init__(self, master, on_change):
         super().__init__(master, fg_color="transparent")
@@ -27,7 +27,10 @@ class PlotSelectionPanel(ctk.CTkFrame):
         self.list_frame = ctk.CTkScrollableFrame(self, fg_color="transparent", height=220)
         self.list_frame.pack(fill="both", expand=True)
 
-    def refresh(self, channels):
+    def refresh(self, channels, differences=None, preserve_selection=True):
+        differences = differences or []
+        existing_selected = set(self.get_selected_keys()) if preserve_selection else set()
+
         for child in self.list_frame.winfo_children():
             child.destroy()
         self._variables.clear()
@@ -41,7 +44,16 @@ class PlotSelectionPanel(ctk.CTkFrame):
                 flt_label = f"   • {flt.material} ({flt.thickness * 1e4:.1f} µm)"
                 self._add_checkbox(flt_label, flt_key, padx=10, pady=1)
 
-        self.list_frame.update_idletasks()
+        if differences:
+            divider = ctk.CTkLabel(self.list_frame, text="Differences", anchor="w", font=ctk.CTkFont(weight="bold"))
+            divider.pack(fill="x", padx=4, pady=(6, 2))
+            for label, key in differences:
+                self._add_checkbox(f"   • {label}", key, padx=10, pady=1)
+
+        if existing_selected:
+            self.set_selected_keys([k for k in existing_selected if k in self._variables], exclusive=True)
+        else:
+            self.list_frame.update_idletasks()
 
     def _add_checkbox(self, label, key, padx=4, pady=2):
         var = ctk.BooleanVar(value=False)

@@ -4,9 +4,9 @@ import numpy as np
 import xraydb
 
 from .calculator import RossFilterCalculator
-from .filter import Channel
 from .material import get_material_list
 from .plot_manager import PlotManager
+from .plot_selection import PlotSelectionPanel
 from .units import um_to_cm, kev_to_ev
 
 
@@ -59,14 +59,13 @@ class AutocompleteComboBox(ctk.CTkComboBox):
 
 
 class ChannelWidget(ctk.CTkFrame):
-    """Widget representing a single channel in the list."""
-    def __init__(self, master, channel_idx, channel: Channel, 
+    """Widget representing a single channel in the list (CRUD only)."""
+
+    def __init__(self, master, channel_idx, channel, 
                  on_select_callback, 
                  on_delete_channel_callback,
                  on_edit_filter_callback,
                  on_delete_filter_callback,
-                 selection_vars: dict,
-                 on_selection_change,
                  is_selected=False, **kwargs):
         super().__init__(master, **kwargs)
         self.channel_idx = channel_idx
@@ -75,8 +74,6 @@ class ChannelWidget(ctk.CTkFrame):
         self.on_delete_channel_callback = on_delete_channel_callback
         self.on_edit_filter_callback = on_edit_filter_callback
         self.on_delete_filter_callback = on_delete_filter_callback
-        self.selection_vars = selection_vars
-        self.on_selection_change = on_selection_change
         
         self.selected_color = ("#3B8ED0", "#1F6AA5")  # ctk theme color
         self.default_color = ("#EBEBEB", "#2B2B2B")   # ctk frame color
@@ -87,52 +84,42 @@ class ChannelWidget(ctk.CTkFrame):
         
         self.grid_columnconfigure(0, weight=1)
         
-        # Header with checkbox
         header_frame = ctk.CTkFrame(self, fg_color="transparent")
         header_frame.grid(row=0, column=0, sticky="ew", padx=10, pady=(5, 2))
         header_frame.grid_columnconfigure(1, weight=1)
+        header_frame.bind("<Button-1>", self._on_click, add=True)
+        header_frame.bind("<Button-3>", self._show_header_menu, add=True)
 
-        chan_key = ("channel", channel_idx)
-        chan_var = self._get_var(chan_key)
-        self.header_check = ctk.CTkCheckBox(
-            header_frame,
-            text=f"Channel {channel_idx + 1}",
-            variable=chan_var,
-            command=self.on_selection_change
-        )
-        self.header_check.grid(row=0, column=0, sticky="w")
-        self.header_check.bind("<Button-1>", self._stop_click_propagation)
-        self.header_check.bind("<Button-3>", self._show_header_menu)
+        chan_label = ctk.CTkLabel(header_frame, text=f"Channel {channel_idx + 1}", font=ctk.CTkFont(weight="bold"))
+        chan_label.grid(row=0, column=0, sticky="w")
+        chan_label.bind("<Button-1>", self._on_click, add="+")
+        chan_label.bind("<Button-3>", self._show_header_menu, add="+")
         
         # Header Context Menu
         self.header_menu = tk.Menu(self, tearoff=0)
         self.header_menu.add_command(label="Delete Channel", command=lambda: self.on_delete_channel_callback(self.channel_idx))
 
-        # Filters list
+        # Filters list (display only; CRUD via context menu)
         self.filters_frame = ctk.CTkFrame(self, fg_color="transparent")
         self.filters_frame.grid(row=1, column=0, sticky="ew", padx=10, pady=(0, 5))
+        self.filters_frame.bind("<Button-1>", self._on_click, add=True)
+        self.filters_frame.bind("<Button-3>", self._show_header_menu, add=True)
         
         if not channel.filters:
             lbl = ctk.CTkLabel(self.filters_frame, text="(Empty)", text_color="gray", font=ctk.CTkFont(size=11))
             lbl.grid(row=0, column=0, sticky="w")
-            lbl.bind("<Button-3>", self._show_header_menu)
+            lbl.bind("<Button-1>", self._on_click, add="+")
+            lbl.bind("<Button-3>", self._show_header_menu, add="+")
         else:
             for i, flt in enumerate(channel.filters):
                 text = f"• {flt.material} ({flt.thickness*1e4:.1f} µm)"
                 if flt.density:
                     text += f" [{flt.density} g/cm³]"
 
-                flt_key = ("filter", channel_idx, i)
-                flt_var = self._get_var(flt_key)
-                chk = ctk.CTkCheckBox(
-                    self.filters_frame,
-                    text=text,
-                    variable=flt_var,
-                    command=self.on_selection_change
-                )
-                chk.grid(row=i, column=0, sticky="w")
-                chk.bind("<Button-1>", self._stop_click_propagation)
-                chk.bind("<Button-3>", lambda e, f_idx=i: self._show_filter_menu(e, f_idx))
+                lbl = ctk.CTkLabel(self.filters_frame, text=text, anchor="w")
+                lbl.grid(row=i, column=0, sticky="w")
+                lbl.bind("<Button-1>", self._on_click, add="+")
+                lbl.bind("<Button-3>", lambda e, f_idx=i: self._show_filter_menu(e, f_idx), add="+")
 
     def _on_click(self, event):
         self.on_select_callback(self.channel_idx)
@@ -152,14 +139,6 @@ class ChannelWidget(ctk.CTkFrame):
         finally:
             menu.grab_release()
 
-    def _get_var(self, key):
-        if key not in self.selection_vars:
-            self.selection_vars[key] = ctk.BooleanVar(value=False)
-        return self.selection_vars[key]
-
-    def _stop_click_propagation(self, event):
-        return "break"
-
 
 class RossFilterGUI:
     def __init__(self, calculator: RossFilterCalculator):
@@ -167,13 +146,16 @@ class RossFilterGUI:
         self.window = ctk.CTk()
         self.window.title("Ross Filter Calculator")
         self.window.geometry("1400x900")
-        self.selection_vars: dict = {}
+        self.difference_count = 0
         
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("blue")
 
         self.selected_channel_idx = -1
         self.editing_filter_idx = None # (channel_idx, filter_idx) or None
+        self.selection_panel = None
+        self._channel_refresh_job = None
+        self._channel_refresh_preserve = True
 
         # Main Layout
         self.window.grid_columnconfigure(1, weight=1)
@@ -225,7 +207,7 @@ class RossFilterGUI:
         self.action_frame = ctk.CTkFrame(self.left_panel, fg_color="transparent")
         self.action_frame.grid(row=4, column=0, padx=10, pady=10, sticky="ew")
         
-        self.calc_btn = ctk.CTkButton(self.action_frame, text="Calculate Transmission", height=40, command=self._calculate)
+        self.calc_btn = ctk.CTkButton(self.action_frame, text="Calculate Filter Bands", height=40, command=self._calculate)
         self.calc_btn.pack(side="left", expand=True, fill="x", padx=(0, 5))
         
         self.reset_btn = ctk.CTkButton(self.action_frame, text="Reset", width=80, height=40, fg_color="darkred", hover_color="red", command=self._reset)
@@ -248,7 +230,7 @@ class RossFilterGUI:
         
         ctk.CTkLabel(self.energy_frame, text="Stop:").grid(row=1, column=2, padx=5)
         self.energy_stop = ctk.CTkEntry(self.energy_frame, width=60)
-        self.energy_stop.insert(0, "50.0")
+        self.energy_stop.insert(0, "20.0")
         self.energy_stop.grid(row=1, column=3, padx=5, pady=5, sticky="ew")
         
         ctk.CTkLabel(self.energy_frame, text="Step:").grid(row=1, column=4, padx=5)
@@ -289,10 +271,14 @@ class RossFilterGUI:
 
     def _setup_right_panel(self):
         self.right_panel.grid_rowconfigure(0, weight=1)
-        self.right_panel.grid_columnconfigure(0, weight=1)
+        self.right_panel.grid_columnconfigure(0, weight=3)
+        self.right_panel.grid_columnconfigure(1, weight=1)
 
         self.plot_manager = PlotManager(self.right_panel)
         self.plot_manager.widget.grid(row=0, column=0, sticky="nsew")
+
+        self.selection_panel = PlotSelectionPanel(self.right_panel, on_change=self._on_selection_changed)
+        self.selection_panel.grid(row=0, column=1, sticky="ns", padx=8, pady=8)
 
     def _log(self, msg):
         self.console.insert("end", f"{msg}\n")
@@ -302,19 +288,17 @@ class RossFilterGUI:
         idx = self.calculator.add_channel()
         self._log(f"Added Channel {idx + 1}")
         self.selected_channel_idx = idx
-        self._refresh_channel_list()
+        self.difference_count = 0
+        self._request_channel_refresh()
         self._update_filter_creator_state()
 
     def _select_channel(self, idx):
         self.selected_channel_idx = idx
         self.editing_filter_idx = None
-        self._refresh_channel_list() # To update selection visuals
+        self._request_channel_refresh() # To update selection visuals
         self._update_filter_creator_state()
 
-    def _refresh_channel_list(self):
-        existing_vars = self.selection_vars
-        present_keys = set()
-
+    def _refresh_channel_list(self, preserve_selection=True):
         for widget in self.channel_list_frame.winfo_children():
             widget.destroy()
 
@@ -327,22 +311,38 @@ class RossFilterGUI:
                 on_delete_channel_callback=self._delete_channel,
                 on_edit_filter_callback=self._edit_filter,
                 on_delete_filter_callback=self._delete_filter,
-                selection_vars=existing_vars,
-                on_selection_change=self._on_selection_changed,
                 is_selected=(i == self.selected_channel_idx)
             )
             cw.pack(fill="x", pady=2)
 
-            present_keys.add(("channel", i))
-            for f_idx in range(len(channel.filters)):
-                present_keys.add(("filter", i, f_idx))
+        self._refresh_selection_panel(preserve_selection=preserve_selection)
 
-        # Drop vars for items that no longer exist
-        for key in list(existing_vars.keys()):
-            if key not in present_keys:
-                existing_vars.pop(key, None)
+    def _refresh_selection_panel(self, preserve_selection=True):
+        if not self.selection_panel:
+            return
 
-        self.selection_vars = existing_vars
+        differences = []
+        for i in range(self.difference_count):
+            label = f"Diff {i + 1}-{i + 2}"
+            key = ("diff", i)
+            differences.append((label, key))
+
+        self.selection_panel.refresh(
+            self.calculator.channels,
+            differences=differences,
+            preserve_selection=preserve_selection
+        )
+
+    def _request_channel_refresh(self, preserve_selection=True):
+        self._channel_refresh_preserve = self._channel_refresh_preserve and preserve_selection
+        if self._channel_refresh_job is None:
+            self._channel_refresh_job = self.window.after_idle(self._perform_channel_refresh)
+
+    def _perform_channel_refresh(self):
+        self._channel_refresh_job = None
+        preserve = self._channel_refresh_preserve
+        self._channel_refresh_preserve = True
+        self._refresh_channel_list(preserve_selection=preserve)
 
     def _update_filter_creator_state(self):
         if self.selected_channel_idx >= 0 and self.selected_channel_idx < len(self.calculator.channels):
@@ -401,7 +401,8 @@ class RossFilterGUI:
                 self._log(f"Error: {msg}")
 
         if success:
-            self._refresh_channel_list()
+            self.difference_count = 0
+            self._request_channel_refresh()
             self._update_filter_creator_state()
             self._plot_selected_series()
 
@@ -422,7 +423,8 @@ class RossFilterGUI:
                 self.selected_channel_idx = -1
             elif self.selected_channel_idx > channel_idx:
                 self.selected_channel_idx -= 1
-            self._refresh_channel_list()
+            self.difference_count = 0
+            self._request_channel_refresh()
             self._update_filter_creator_state()
         else:
             self._log(f"Error: {msg}")
@@ -431,7 +433,8 @@ class RossFilterGUI:
         success, msg = self.calculator.remove_filter_from_channel(channel_idx, filter_idx)
         if success:
             self._log(msg)
-            self._refresh_channel_list()
+            self.difference_count = 0
+            self._request_channel_refresh()
             self._plot_selected_series()
         else:
             self._log(f"Error: {msg}")
@@ -447,7 +450,7 @@ class RossFilterGUI:
         self.thickness_var.set(str(flt.thickness * 1e4)) # cm to um
         self.density_var.set(str(flt.density) if flt.density else "")
         
-        self._refresh_channel_list()
+        self._request_channel_refresh()
         self._update_filter_creator_state()
         self._log(f"Editing Filter {filter_idx + 1} in Channel {channel_idx + 1}")
 
@@ -501,36 +504,37 @@ class RossFilterGUI:
         success, result = self.calculator.calculate_transmission(*erange)
         
         if success:
-            energies_kev = result.energies_ev / 1000.0
+            self.difference_count = len(result.differences)
+            self._refresh_selection_panel(preserve_selection=False)
+            if self.selection_panel:
+                self.selection_panel.set_selected_keys([], exclusive=True)
 
             self.plot_manager.clear(title="Ross Filter Transmission")
-            
-            for i, trans in enumerate(result.transmissions):
-                self.plot_manager.plot_series(energies_kev, trans, label=f"Ch {i+1}")
-                
-            for i, diff in enumerate(result.differences):
-                self.plot_manager.plot_series(energies_kev, diff, style='--', label=f"Diff {i+1}-{i+2}")
-                self.plot_manager.fill_between(energies_kev, diff, alpha=0.2)
-
             self.plot_manager.draw()
-            self._log("Calculation complete.")
+            self._log("Filter bands calculated. Select items to plot from Plot Selection.")
         else:
+            self.difference_count = 0
+            self._refresh_selection_panel(preserve_selection=True)
             self._log(f"Error: {result}")
 
     def _reset(self):
         self.calculator.reset()
         self.selected_channel_idx = -1
         self.editing_filter_idx = None
-        self._refresh_channel_list()
+        self.difference_count = 0
+        self._request_channel_refresh(preserve_selection=False)
         self._update_filter_creator_state()
+        self._refresh_selection_panel(preserve_selection=False)
+        if self.selection_panel:
+            self.selection_panel.set_selected_keys([], exclusive=True)
         self.plot_manager.clear(title="Ross Filter Transmission")
         self.plot_manager.draw()
         self._log("Reset all channels.")
 
-    def _on_selection_changed(self, *args):
-        self._plot_selected_series()
+    def _on_selection_changed(self, keys):
+        self._plot_selected_series(keys)
 
-    def _plot_selected_series(self):
+    def _plot_selected_series(self, selected_keys=None):
         erange = self._get_energy_range()
         if not erange:
             self._log("Error: Invalid energy range")
@@ -541,8 +545,15 @@ class RossFilterGUI:
         energies_ev = kev_to_ev(energies_kev)
 
         try:
-            selected = [key for key, var in self.selection_vars.items() if var.get()]
+            selected = selected_keys if selected_keys is not None else (
+                self.selection_panel.get_selected_keys() if self.selection_panel else []
+            )
+
             self.plot_manager.clear(title="Selected Transmissions")
+
+            if not selected:
+                self.plot_manager.draw()
+                return
 
             for key in selected:
                 if key[0] == "channel":
@@ -550,14 +561,25 @@ class RossFilterGUI:
                     channel = self.calculator.channels[c_idx]
                     transmission = channel.calculate_transmission(energies_ev)
                     label = f"Channel {c_idx + 1}"
-                else:
+                    self.plot_manager.plot_series(energies_kev, transmission, label=label)
+                elif key[0] == "filter":
                     c_idx, f_idx = key[1], key[2]
                     channel = self.calculator.channels[c_idx]
                     transmission = channel.calculate_single_filter(f_idx, energies_ev)
                     flt = channel.filters[f_idx]
                     label = f"Ch {c_idx + 1}: {flt.material}"
-
-                self.plot_manager.plot_series(energies_kev, transmission, label=label)
+                    self.plot_manager.plot_series(energies_kev, transmission, label=label)
+                elif key[0] == "diff":
+                    d_idx = key[1]
+                    if d_idx + 1 < len(self.calculator.channels):
+                        ch1 = self.calculator.channels[d_idx]
+                        ch2 = self.calculator.channels[d_idx + 1]
+                        t1 = ch1.calculate_transmission(energies_ev)
+                        t2 = ch2.calculate_transmission(energies_ev)
+                        diff = np.abs(t1 - t2)
+                        label = f"Diff {d_idx + 1}-{d_idx + 2}"
+                        self.plot_manager.plot_series(energies_kev, diff, label=label, style="--")
+                        self.plot_manager.fill_between(energies_kev, diff, alpha=0.2)
 
             self.plot_manager.draw()
         except Exception as e:
